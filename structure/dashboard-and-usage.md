@@ -165,7 +165,7 @@ keeps the saved state and renders fixed `ocx sync` guidance without server/accou
 `OcxUsage.providerCredits` preserves provider-reported credit spend in request and attempt rows
 through `src/usage/log.ts` normalization and ledger reloads. Missing readings stay absent, and zero
 is a measured value. Separate attempts add credits when usage is merged. The field is independent
-of token estimation (`estimated` describes tokens) and is never treated as USD or token usage. The human log projection in `src/cli/observe.ts` includes the persisted request ID as `id=...` for direct use with `ocx logs get` and `ocx logs explain`. Rows without an ID or with control characters in their ID omit it rather than rewriting the lookup key; JSON and JSONL keep the API payload. `ocx logs history` pages the same derived index the dashboard uses (`GET /api/request-history`) with a resumable `nextCursor`. Client labels follow the [attribution contract](usage-client-attribution.md).
+of token estimation (`estimated` describes tokens) and is never treated as USD or token usage. The shared heuristic in `src/lib/token-estimate.ts` counts supplementary Han surrogate pairs as two CJK code units alongside its existing BMP buckets; model ratios and context-window caps stay unchanged. The human log projection in `src/cli/observe.ts` includes the persisted request ID as `id=...` for direct use with `ocx logs get` and `ocx logs explain`. Rows without an ID or with control characters in their ID omit it rather than rewriting the lookup key; JSON and JSONL keep the API payload. `ocx logs history` pages the same derived index the dashboard uses (`GET /api/request-history`) with a resumable `nextCursor`. Client labels follow the [attribution contract](usage-client-attribution.md).
 
 ### Upstream key account attribution
 
@@ -192,7 +192,7 @@ observations separate from token or API-equivalent cost totals.
 
 Custom usage windows are immutable bounds on the streaming accumulator, applied before attribution and daily
 aggregation. The filtered cache includes both inclusive millisecond bounds in its identity and retains the existing ledger revision, overlay-version and timezone checks.
-At most four distinct filtered scans may run concurrently; identical requests share one scan and excess distinct
+At most four distinct filtered reads may run concurrently; identical requests share one flight and excess distinct
 work fails closed. Preset warming never consumes custom summaries.
 The response retains its preset range discriminator for compatibility and explicitly marks
 `customWindow`, `since`, and `until`; the chart uses the window's local calendar days with
@@ -353,7 +353,7 @@ An oversized row is skipped inside the scanner bound without shortening identiti
 64 KiB checkpoint followed by file growth is intentionally outside the incremental detector's
 contract: validating arbitrary historical rewrites on every refresh would require rereading the
 whole prefix. Replace or truncate the file, or restart the proxy, after manually changing historical
-rows so the next request performs a cold rebuild.
+rows so the next request performs a cold rebuild. The candidate index shares that contract and is stricter about it: any same-size metadata movement rebuilds it.
 
 The wire fields `historyTruncated`, `truncatedPrefixBytes`, `entriesTruncated`, and `entriesDropped`
 remain in the response for compatibility with older GUI and CLI clients. A successful whole-ledger
