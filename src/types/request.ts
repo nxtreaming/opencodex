@@ -93,6 +93,8 @@ export interface OcxParsedRequest {
    * adapter ends a system block there so the breakpoint stays off the per-turn tail.
    */
   _anthropicSystemCachePrefix?: string;
+  /** The request arrived on the Anthropic Messages surface (Claude Code, Claude Desktop). */
+  _anthropicInbound?: boolean;
   /**
    * Boundary between replayed history and this turn's newly appended input. Usually the
    * items the proxy restored from local previous_response_id state; also set when the
@@ -146,6 +148,8 @@ export interface OcxParsedRequest {
   _dropForeignReasoningItemIds?: boolean;
   /** Final-route opt-in: emit v2 collaboration message arguments as plaintext on ChatGPT. */
   _plaintextV2AgentMessages?: boolean;
+  _plaintextV2Decision?: boolean;
+  _plaintextV2EverPrepared?: boolean;
   /**
    * Optional authenticated tenant/operator namespace for Cursor thread→conversation derivation.
    * When absent (single-operator local proxy), derivation stays local-scoped.
@@ -217,6 +221,14 @@ export interface OcxParsedRequest {
    * provider-private continuation caches again on every later turn.
    */
   _contextCompactionBoundary?: boolean;
+  /**
+   * Codex's own per-turn metadata for this request says `history_initialization: "New"` (HTTP header,
+   * or a WebSocket frame's own `client_metadata`). Read once in request preparation; the experimental
+   * Anthropic `perMessageEffort` option takes it as the new-transcript receipt (#6895).
+   */
+  _codexNewHistory?: boolean;
+  /** This turn's per-message effort bookkeeping (src/adapters/anthropic/per-message-effort.ts). */
+  _perMessageEffort?: PerMessageEffortTurn;
   /**
    * Core-owned registration slot for the optional advisor subsystem (src/advisor). Set per request
    * by the sidecar planner, never at module load: the core Responses path only sees this
@@ -557,6 +569,17 @@ export type AdapterEvent =
 export interface OcxUrlCitation {
   url: string;
   title?: string;
+}
+
+/**
+ * One turn's per-message effort state (#6895). Spread copies of the parsed request share it, so a
+ * rebuild of the same turn is seen as a second build.
+ */
+export interface PerMessageEffortTurn {
+  /** The pending decision this turn owns, until it commits or is abandoned. */
+  token?: string;
+  generation: string;
+  builds: number;
 }
 
 /**

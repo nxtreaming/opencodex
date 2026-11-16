@@ -1,4 +1,5 @@
 import { recordUpstreamProviderErrorDetail } from "../request-log-failure-detail";
+import { providerAffinityGenerationIsCurrent } from "../../providers/api-key-selection";
 import { clientFacingModelText } from "../../lib/error-destination";
 import { responsesSpendTarget } from "./request-spend-target";
 import { projectLocalModelRefusalLog } from "../request-log-failure-detail";
@@ -63,6 +64,7 @@ import {
   sleepWithAbort,
 } from "../../lib/upstream-retry";
 import { describeUpstreamConnectFailure } from "./upstream-error";
+import { createOfflineResendWait, resolveOfflineResendWaitMs } from "../../lib/offline-resend";
 import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import type { AttemptRecoveryKind } from "../../usage/log";
 import type { OAuthAccessSnapshot } from "../../oauth";
@@ -91,6 +93,7 @@ import {
   quarantineKiroSuspendedAccount,
   failoverAccountSnapshot,
   rotateAntigravityAccountOnAuthRefusal,
+  rotateAntigravityAccountOnUpstreamFault,
 } from "../../oauth/generic-account-failover";
 import {
   attemptOpaqueBlobRecovery,
@@ -110,7 +113,6 @@ import { isFixedCodexAccount } from "./core-codex-account";
 import { recordSubagentQuotaFailureForThreadSpawn } from "../../codex/subagent-model-fallback";
 import {
   CYBER_POLICY_ERROR_CODE,
-  SEND_BUDGET_EXHAUSTED_CODE,
 } from "../../lib/errors";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { cancelBodyOnAbort } from "../../lib/abort";
@@ -119,10 +121,11 @@ import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { mapCodexAuthContextErrorToResponse } from "./codex-auth-error";
 import { chargeWorkflowSends } from "../../lib/workflow-budget";
 import { hasWorkflowSendObserver } from "../../lib/request-execution-budget";
-import { isAntigravityValidationRefusal } from "./antigravity-validation-refusal";
+import { isAntigravityAccessDeniedRefusal, isAntigravityValidationRefusal } from "./antigravity-validation-refusal";
 import { createAntigravityModelDenialRecovery, recoverAntigravityAccount } from "./antigravity-model-denial-recovery";
-import { unboundPoolSpendRefusalResponse, workflowSendCeilingRefusalResponse } from "../workflow-refusal";
+import { adapterSendBudgetRefusal } from "../workflow-refusal";
 import { AdmissionModelDeniedError, admissionModelDeniedResponse, projectAdmissionModelDeniedLog } from "../admission-model-scope";
+import { rejectAnthropicPerMessageEffort } from "../../adapters/anthropic/per-message-effort";
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function prepareAdapterExchange(
   requestContext: Pick<ResponsesRequestContext, "options" | "config" | "logCtx" | "req">,
@@ -521,6 +524,7 @@ export async function prepareAdapterExchange(
           abortSignal: upstream.signal,
           label: safeHostLabel(builtInitialRequest.url), destination: errorDestinationLabel(builtInitialRequest.url),
           claimAmbiguousResend: claimPreHeaderResend,
+          offlineWait: options.comboAttempt ? undefined : createOfflineResendWait(builtInitialRequest.url, resolveOfflineResendWaitMs(config.offlineResendWaitSec)),
           ...(sendBudgetState.workflowRootId || sendBudgetState.adapterSendBudget?.spendEnforced || options.comboDispatchPermit || transientPolicy || resetPolicy || compactPrepaid || options.comboAttempt
             || billingPoolRequest || autoPauseEnabled
             ? {
@@ -577,8 +581,7 @@ export async function prepareAdapterExchange(
     // blaming the provider makes the caller send the whole turn again -- the amplification this
     // budget exists to stop. The passthrough path has answered 429 here since #4546.
     if (err instanceof SendBudgetExhaustedError) {
-      return unboundPoolSpendRefusalResponse(logCtx) ?? workflowSendCeilingRefusalResponse(logCtx, sendBudgetState.workflowRootId)
-        ?? markProxyError(formatErrorResponse(429, SEND_BUDGET_EXHAUSTED_CODE, err.message));
+      return adapterSendBudgetRefusal(logCtx, sendBudgetState.workflowRootId, err.message);
     }
     const msg = describeUpstreamConnectFailure(err, connectMs);
     return formatErrorResponse(502, "upstream_error", msg);
@@ -612,6 +615,7 @@ export async function prepareAdapterExchange(
     const consoleGoUploadRetryGuard: { attempted: boolean } = { attempted: false };
     let oauth401ReplayAttempted = transportState.oauth401ReplayAttempted;
     let antigravityAuthRotationAttempted = false;
+    let antigravityFaultRotationAttempted = false;
     // Direct requests get one reasoning-effort downgrade. Combo candidates may walk down the
     // published ladder one refused rung at a time; the request send budget bounds those retries.
     const reasoningEffortDowngradeGuard: { attempted: boolean } = { attempted: false };
@@ -864,8 +868,7 @@ export async function prepareAdapterExchange(
         // Same rule on the recovery leg: the ladder refused to send again, so the answer names
         // this proxy rather than the provider it never reached.
         if (err instanceof SendBudgetExhaustedError) {
-          return { failed: unboundPoolSpendRefusalResponse(logCtx) ?? workflowSendCeilingRefusalResponse(logCtx, sendBudgetState.workflowRootId)
-            ?? markProxyError(formatErrorResponse(429, SEND_BUDGET_EXHAUSTED_CODE, err.message)) };
+          return { failed: adapterSendBudgetRefusal(logCtx, sendBudgetState.workflowRootId, err.message) };
         }
         const msg = describeUpstreamConnectFailure(err, connectMs);
         return { failed: formatErrorResponse(502, "upstream_error", msg) };
@@ -879,14 +882,14 @@ export async function prepareAdapterExchange(
     const rotateAntigravityAuth = async (
       failedResponse: Response,
       recovery: AttemptRecoveryKind,
-      modelAccountId?: string,
+      // An account id (model-404 recovery already chose it) or a selector; the 403 refusal default.
+      pick: string | ((sent: { accountId: string; generation: string }) => string | null) = sent =>
+        rotateAntigravityAccountOnAuthRefusal(antigravityPoolActivated, sent.accountId, sent.generation, route.modelId),
     ): Promise<Response | null> => {
       const sent = transportState.replayOAuthCredentialSnapshot ?? transportState.sentOAuthSnapshot;
       if (!antigravityPoolActivated || !sent
         || transportState.genericFailovers >= transportState.genericFailoverLimit) return null;
-      const nextId = modelAccountId ?? rotateAntigravityAccountOnAuthRefusal(
-        antigravityPoolActivated, sent.accountId, sent.generation, route.modelId,
-      );
+      const nextId = typeof pick === "string" ? pick : pick(sent);
       if (!nextId) return null;
       const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
       return recoverAntigravityAccount({ nextId, failedResponse, adapterOwnsDispatch,
@@ -933,6 +936,7 @@ export async function prepareAdapterExchange(
 
       // Preserve the terminal verdict through adapter and combo error formatting.
       // This also covers a reset reached by a 401/429/413 recovery refetch.
+      await rejectAnthropicPerMessageEffort(parsed, upstreamResponse, upstream.signal);
       if (isNonReplayableResponse(upstreamResponse)) {
         try {
           return await sanitizeNonReplayableUpstreamError(upstreamResponse, upstream.signal);
@@ -1078,12 +1082,29 @@ export async function prepareAdapterExchange(
 
       if (route.providerName === "google-antigravity" && upstreamResponse.status === 403
         && transportState.activeAdapter.name === "google"
-        && antigravityPoolActivated && !antigravityAuthRotationAttempted
+        && antigravityPoolActivated
         && !isNonReplayableResponse(upstreamResponse)
         && transportState.genericFailovers < transportState.genericFailoverLimit
-        && await isAntigravityValidationRefusal(upstreamResponse, options.abortSignal)) {
+        && (!antigravityAuthRotationAttempted && await isAntigravityValidationRefusal(upstreamResponse, options.abortSignal)
+          // A plain access-denied 403 keeps rotating while siblings remain: each refused account is
+          // cooled before the hop, so the ring advances and `genericFailoverLimit` bounds the sends.
+          || await isAntigravityAccessDeniedRefusal(upstreamResponse, options.abortSignal))) {
         antigravityAuthRotationAttempted = true;
         const rotated = await rotateAntigravityAuth(upstreamResponse, "oauth-account-403");
+        if (rotated) { upstreamResponse = rotated; continue recovery; }
+      }
+
+      // A 502/503/504 that outlived the same-account ladder is replayed once on a live sibling: the
+      // failing account is cooled briefly (not marked), and one extra ladder bounds the load a
+      // pool-wide outage can add to a request.
+      if (route.providerName === "google-antigravity" && [502, 503, 504].includes(upstreamResponse.status)
+        && transportState.activeAdapter.name === "google"
+        && antigravityPoolActivated && !antigravityFaultRotationAttempted
+        && !isNonReplayableResponse(upstreamResponse)
+        && transportState.genericFailovers < transportState.genericFailoverLimit) {
+        antigravityFaultRotationAttempted = true;
+        const rotated = await rotateAntigravityAuth(upstreamResponse, "transient-5xx", sent =>
+          rotateAntigravityAccountOnUpstreamFault(antigravityPoolActivated, sent.accountId, sent.generation, route.modelId));
         if (rotated) { upstreamResponse = rotated; continue recovery; }
       }
 
@@ -1230,7 +1251,7 @@ export async function prepareAdapterExchange(
       // key on rate-limit blips; only after the attempts are exhausted does failover run.
       while (
         upstreamResponse.status === 429 && !isSameTargetRetryHold(upstreamResponse)
-        && rateLimitPolicy !== null
+        && rateLimitPolicy !== null && providerAffinityGenerationIsCurrent(config, route.providerName, route.provider)
         && rateLimitRetries < rateLimitPolicy.attempts
         && !sendBudgetExhausted()
       ) {
