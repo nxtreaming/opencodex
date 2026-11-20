@@ -28,6 +28,8 @@ lazily, caches a failed load as unavailable, and closes every handle in a `final
 - an exit watch: a handle opened at bind time and polled with `WaitForSingleObject(handle, 0)`;
 - the Task Scheduler service host PID through `QueryServiceStatusEx` on `Schedule`, only while it runs.
 
+Link stop reads a live process’s creation time and token user through one handle. To verify a stop owner, it also reads the command line through that handle using `src/config/windows-process-command-line.ts`. The creation time uses .NET ticks truncated to CIM’s microsecond precision so existing receipts and runtime records still match. If the native API is unavailable, a bounded CIM probe refreshes the creation time after reading the SID. A failed native read leaves the identity unverified. Forced Link termination requires the native handle and compares the saved creation time and token user on that handle before ending the process.
+
 Windows ARM64, other platforms and any test that simulates a platform get no native API.
 `src/service/windows-process-evidence.ts` is the facade the operations use. Its process snapshot is
 one capped PowerShell snapshot that emits UTF-8 JSON and uses ISO UTC for `CreationDate`.
@@ -35,7 +37,10 @@ It reads owner SIDs for command lines carrying this home's launcher or service s
 tokens first, then other wrapper images, unreadable images, and command lines containing the fixed
 `opencodex-service` basename prefix. Owner enrichment admits at most 32 candidates within
 1.5 s after enumeration and prioritization, with a 1 s operation timeout on each owner or refresh
-call. Every row is retained and skipped owners remain unknown. The refresh is skipped if
+call. No owner read starts later than the snapshot timeout minus 2 s, counted from the
+helper process's start, so a cold PowerShell start or slow first CIM query cannot push owner
+enrichment past the cap and lose the whole table. Every row is retained and skipped owners
+remain unknown. The refresh is skipped if
 the owner query spends the budget. Owner verification requires a successful `GetOwnerSid`,
 valid local/domain or Entra ID SIDs, and a fresh CIM read reporting the original creation time.
 Matching SIDs prove the current account. Different supported SIDs prove a foreign account.

@@ -217,9 +217,9 @@ fixed at the bridge entry mark, before an effort override rewrites `thinking`.
 Messages wires without the internal Responses SSE. It is server side and not a leaf.
 `adapter-events.ts` is the driver: it ports the item state machine of `bridgeToResponsesSSE`, including `tool_call_end.incomplete`, which closes an unfinished item without claiming argument completion
 (item boundaries, signature grouping, hidden and redacted reasoning envelopes, tool naming and
-argument gating, the integral-float repair, every terminal with its usage and durability rule,
-the wire-silence heartbeat and live-destination stall watchdog ([timeout policy](../transports/timeouts.md)), pull-based stepping, cancellation) and calls one
-`ClientWireWriter` method wherever the bridge would emit a frame a client converter reads.
+argument gating, integral-float repair, terminal usage and durability, wire-silence heartbeats,
+pull-based stepping and cancellation) and calls a `ClientWireWriter` method for each frame a client converter reads.
+The live-destination [stall watchdog](../transports/timeouts.md#provider-scoped-budgets) resets on parsed adapter events, matching the Responses bridge.
 `chat.ts` (`encodeChatCompletionSse`, `foldChatCompletion`) and `messages.ts`
 (`encodeAnthropicMessageSse`, `foldAnthropicMessage`) are the writers; the Chat one also emits `reasoning_details` ([#7429](chat-reasoning-details.md)). They reuse the
 converters' own helpers, exported from `src/chat/outbound.ts` and `src/claude/outbound.ts`
@@ -554,8 +554,8 @@ the key-auth one. The Chat and Messages ingresses read the unrepresentable polic
 the Messages ingress and the planner; the Chat ingress reads `nativeChatCombos`
 for combo routes (above); `managedMessagesNative` and `managedMessagesNativeOAuth` are read
 through `nativeMessagesDeclineReason` by the Messages ingress, `count_tokens` and the planner
-(above); `shadowPlan` is read by `recordProtocolShadowPlan` ([Shadow plan](#shadow-plan)). Every
-rollout switch now has a reader.
+(above). `geminiNativeAntigravity` enables the [native Gemini leg](gemini-native.md) for eligible
+`/v1beta` requests. `recordProtocolShadowPlan` reads `shadowPlan` ([Shadow plan](#shadow-plan)).
 
 `claudeInboundDisabled` in `src/server/claude-messages.ts` is the Messages ingress reader: both
 `/v1/messages` and `/v1/messages/count_tokens` call it, so the two routes cannot disagree, and a
